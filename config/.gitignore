@@ -1,0 +1,13 @@
+# Ignore virtual environment
+venv/
+
+# Ignore configs and secrets
+config/.env
+
+# Ignore output files (optional)
+output/
+
+# Ignore OS / editor specific files
+__pycache__/
+*.pyc
+.DS_Store
