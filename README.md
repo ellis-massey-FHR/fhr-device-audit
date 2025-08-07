@@ -1,4 +1,4 @@
-# FHR Corpus Computer Refresh List last 60 Days
+# FHR Computer Refresh List last 60 Days
 
 
 This script generates a detailed Excel report of laptop or Surface device requests from ServiceNow over the past 60 days, enriched with user workstation data. It includes a summary pie chart of requests by location and filters only valid, corporate-managed Windows workstations. This helps easliy identify users with multiple PC's.
