@@ -5,6 +5,8 @@ import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -179,9 +181,12 @@ if response.status_code == 200:
 
     #--------------------------Write to CSV and Excel-------------------------
 
-    output_dir = r"C:\Users\ellism3\kochind.com\FHR Endpoint Services - FHR Computer Refresh List Last 60 Days"
-    excel_path = os.path.join(output_dir, "fhr_computer_requests.xlsx")
-    df.to_excel(excel_path, index=False, engine="openpyxl")
+    from pathlib import Path
+    output_dir = Path(os.getenv("OUTPUT_DIR", "output"))   # default: ./output
+    output_dir.mkdir(parents=True, exist_ok=True)
+    excel_path = output_dir / "fhr_computer_requests.xlsx"
+    
+# df.to_excel(excel_path, index=False, engine="openpyxl")
 
     #---------------------------Format Excel Header-------------------------
 
