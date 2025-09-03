@@ -67,36 +67,30 @@ def get_current_workstation_from_ci(user_sys_id):
         name = r.get("name")
         class_name = r.get("sys_class_name")
 
-        # model_id may be str or dict depending on sysparm_display_value
         model_id = r.get("model_id")
         if isinstance(model_id, dict):
-            model_name = (model_id.get("display_value") or "").lower()
+            model_name = model_id.get("display_value", "").lower()
         elif isinstance(model_id, str):
             model_name = model_id.lower()
         else:
             model_name = ""
 
-        # --- OS handling: include Windows or UNKNOWN; skip only if we know it's not Windows
         os_raw = r.get("os")
         os_name = os_raw.lower() if isinstance(os_raw, str) else ""
 
-        # Fallbacks in case OS is populated under different fields
-        if not os_name:
-            alt_os = r.get("operating_system") or r.get("u_os_full_name")
-            if isinstance(alt_os, str):
-                os_name = alt_os.lower()
-            elif isinstance(alt_os, dict):
-                os_name = (alt_os.get("display_value") or alt_os.get("value") or "").lower()
+        trust_raw = r.get("u_device_trust")
+        device_trust = trust_raw.lower() if isinstance(trust_raw, str) else ""
 
-        # Skip if we positively know it's not Windows
-        if os_name and "windows" not in os_name:
-            print(f"🛑 Skipping non-Windows device: {name} (OS: {os_name})")
+        # ✅ Only allow Windows devices with AzureAD or HybridAD trust
+        if "windows" not in os_name or device_trust not in ("azuread", "hybridad"):
+            print(f"🛑 Skipping device: {name} (OS: {os_name}, Trust: {device_trust})")
             continue
-
-        #-----------------Sanitize name to prevent newlines from breaking formatting-----------
+        
+#-----------------Sanitize name to prevent newlines from breaking formatting-----------
 
         if isinstance(name, str):
             name = name.replace("\n", " ").replace("\r", " ").strip()
+
 
         if name and class_name:
             device_str = name
@@ -119,7 +113,7 @@ params = {
         "^ORDERBYDESCclosed_at"
     ),
     "sysparm_display_value": "all",
-    "sysparm_limit": "115"
+    "sysparm_limit": "10"
 }
 
 response = requests.get(url, auth=HTTPBasicAuth(username, password), params=params)
@@ -160,7 +154,7 @@ if response.status_code == 200:
 
     df = pd.DataFrame(rows)
 
-    #------------------------------Group by Location--------------------
+#------------------------------Group by Location--------------------
 
     def normalize_location(loc):
         if not loc:
@@ -177,13 +171,15 @@ if response.status_code == 200:
 
     df["Location Group"] = df["Requested For Location"].apply(normalize_location)
 
-    #--------------------------Write to CSV and Excel-------------------------
+#--------------------------Write to CSV and Excel-------------------------
 
     output_dir = r"C:\Users\ellism3\kochind.com\FHR Endpoint Services - FHR Computer Refresh List Last 60 Days"
     excel_path = os.path.join(output_dir, "fhr_computer_requests.xlsx")
     df.to_excel(excel_path, index=False, engine="openpyxl")
 
-    #---------------------------Format Excel Header-------------------------
+
+    
+#---------------------------Format Excel Header-------------------------
 
     wb = load_workbook(excel_path)
     ws = wb.active
@@ -198,7 +194,7 @@ if response.status_code == 200:
     header_cell.font = Font(size=16, bold=True)
     header_cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    #-------------------------Adjust column widths------------------------
+#-------------------------Adjust column widths------------------------
 
     for col in ws.columns:
         max_length = 0
@@ -214,12 +210,11 @@ if response.status_code == 200:
             ws.column_dimensions[col_letter].width = 40
         else:
             ws.column_dimensions[col_letter].width = max_length + 2
-
     from io import BytesIO
     import matplotlib.pyplot as plt
     from openpyxl.drawing.image import Image as XLImage
 
-    #------------------------Embed pie chart--------------------------
+#------------------------Embed pie chart--------------------------
 
     location_counts = df["Location Group"].value_counts()
 
@@ -248,7 +243,7 @@ if response.status_code == 200:
 
     wb.save(excel_path)
     print(f"📁 Excel with embedded chart saved to {excel_path}")
-
+    
 else:
     print(f"❌ Error: {response.status_code}")
     print(response.text)

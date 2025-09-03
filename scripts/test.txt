@@ -1,0 +1,439 @@
+import os
+import json
+import re
+from io import BytesIO
+from pathlib import Path
+from datetime import datetime, timezone
+
+import requests
+from requests.auth import HTTPBasicAuth
+from dotenv import load_dotenv
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Alignment
+from openpyxl.drawing.image import Image as XLImage
+
+# ----------------------- Load environment ----------------------
+env_path = Path(__file__).resolve().parent / "servicenow.env"
+load_dotenv(dotenv_path=env_path)
+
+instance = os.getenv("SERVICENOW_INSTANCE")
+username = os.getenv("SERVICENOW_USER")
+password = os.getenv("SERVICENOW_PASS")
+
+print("ENV path:", env_path)
+print("Instance loaded:", instance)
+print("Username loaded:", username)
+print("Password loaded:", bool(password))
+
+if not all([instance, username, password]):
+    raise RuntimeError("Missing ServiceNow env vars. Check SERVICENOW_INSTANCE/USER/PASS in servicenow.env")
+
+# ----------------------- Helpers -------------------------------
+def _val(x):
+    """Return display_value/value if dict, else the string itself (trimmed)."""
+    if isinstance(x, dict):
+        return (x.get("display_value") or x.get("value") or "").strip()
+    return (x or "").strip()
+
+def first_only(s):
+    """From a delimited string, keep only the first token."""
+    if not s:
+        return None
+    s = str(s).strip()
+    for sep in [",", ";", "\n", "\r"]:
+        if sep in s:
+            return s.split(sep, 1)[0].strip()
+    return s
+
+def _days_since(dt_str):
+    """Return whole days since the given datetime string (ServiceNow format)."""
+    if not dt_str:
+        return None
+    dt = pd.to_datetime(dt_str, utc=True, errors="coerce")
+    if pd.isna(dt):
+        return None
+    now = datetime.now(timezone.utc)
+    return int((now - dt).total_seconds() // 86400)
+
+def format_workstation_string(ws_string):
+    """Clean up newline/comma mess from a free-text workstation list."""
+    if not isinstance(ws_string, str):
+        return ""
+    return ws_string.replace("\\n", ", ").replace("\\r", "").strip().lstrip(", ")
+
+# ----------------------- Robust fetch_details -------------------
+def fetch_details(link):
+    """Follow the requested_for.link and return a dict safely."""
+    if not link:
+        return {}
+    try:
+        res = requests.get(
+            link,
+            auth=HTTPBasicAuth(username, password),
+            headers={"Accept": "application/json"},
+            allow_redirects=False,
+            timeout=30
+        )
+    except requests.RequestException as e:
+        print(f"❌ fetch_details network error: {e}")
+        return {}
+
+    if res.status_code in (301, 302, 303, 307, 308):
+        print(f"❌ fetch_details redirect {res.status_code} → {res.headers.get('Location')}")
+        return {}
+    if res.status_code != 200:
+        print(f"❌ fetch_details HTTP {res.status_code} body[:200]={res.text[:200]!r}")
+        return {}
+
+    try:
+        data = res.json()
+    except ValueError:
+        print(f"❌ fetch_details non-JSON body[:200]={res.text[:200]!r}")
+        return {}
+
+    result = data.get("result", {})
+    if isinstance(result, list):
+        return result[0] if result else {}
+    return result
+
+# ----------------- Last-known workstation via CMDB --------------
+def get_current_workstation_from_ci(user_sys_id):
+    """
+    Return ONLY the newest valid workstation name for this user (or None).
+    Uses your original filter: model_category.name=Computer, ordered by last_discovered DESC.
+    Also enforces Windows + AzureAD/Hybrid on the client side.
+    """
+    if not user_sys_id:
+        return None
+
+    ci_url = f"{instance}/api/now/table/cmdb_ci_computer"
+    params = {
+        "sysparm_query": (
+            f"assigned_to={user_sys_id}"
+            "^model_category.name=Computer"
+            "^ORDERBYDESClast_discovered"
+        ),
+        "sysparm_display_value": "true",
+        "sysparm_limit": "50",
+        "sysparm_fields": ",".join([
+            "name","os","u_device_trust","last_discovered",
+            "install_status","life_cycle_stage_status","operational_status",
+            "discovery_source","sys_created_by","serial_number"
+        ])
+    }
+
+    resp = requests.get(ci_url, auth=HTTPBasicAuth(username, password), params=params, timeout=60)
+    if resp.status_code != 200:
+        print(f"❌ Error fetching CIs: {resp.status_code}")
+        return None
+
+    records = (resp.json() or {}).get("result", []) or []
+    for r in records:  # newest → oldest due to ORDERBYDESClast_discovered
+        name = _val(r.get("name")).replace("\n", " ").replace("\r", " ").strip()
+        if not name:
+            continue
+        os_name = _val(r.get("os")).lower()
+        trust   = _val(r.get("u_device_trust")).lower()
+
+        # Only Windows + AzureAD/Hybrid
+        if "windows" not in os_name:
+            continue
+        if trust not in ("azuread", "hybridad"):
+            continue
+
+        return name  # ✅ first valid = last known
+
+    return None
+
+# ----- Pick one workstation and include provenance/flags --------
+def resolve_user_workstation_with_provenance(user_sys_id, u_ws_text):
+    """
+    Try CMDB first (newest valid). If none, resolve text list against CMDB names.
+    If still none, take the first token from the text list.
+    Returns (ws_name, meta_dict).
+    """
+    meta = {
+        "source": None,
+        "decision": None,
+        "last_discovered": "",
+        "install_status": "",
+        "life_cycle": "",
+        "op_status": "",
+        "discovery_source": "",
+        "created_by": "",
+        "stale_days": None,
+    }
+
+    # A) Direct CMDB lookup (your original filter)
+    if user_sys_id:
+        ci_url = f"{instance}/api/now/table/cmdb_ci_computer"
+        q = (
+            f"assigned_to={user_sys_id}"
+            "^model_category.name=Computer"
+            "^ORDERBYDESClast_discovered"
+        )
+        params = {
+            "sysparm_query": q,
+            "sysparm_display_value": "true",
+            "sysparm_limit": "10",
+            "sysparm_fields": ",".join([
+                "name","os","u_device_trust","last_discovered",
+                "install_status","life_cycle_stage_status","operational_status",
+                "discovery_source","sys_created_by"
+            ])
+        }
+        r1 = requests.get(ci_url, auth=HTTPBasicAuth(username, password), params=params, timeout=60)
+        if r1.status_code == 200:
+            for r in (r1.json() or {}).get("result", []) or []:
+                n = _val(r.get("name")).replace("\n", " ").replace("\r", " ").strip()
+                os_name = _val(r.get("os")).lower()
+                trust   = _val(r.get("u_device_trust")).lower()
+                if not n or "windows" not in os_name or trust not in ("azuread","hybridad"):
+                    continue
+                meta.update({
+                    "source": "cmdb_query",
+                    "decision": "best CMDB match (Windows + AzureAD/Hybrid)",
+                    "last_discovered": _val(r.get("last_discovered")),
+                    "install_status": _val(r.get("install_status")),
+                    "life_cycle": _val(r.get("life_cycle_stage_status")),
+                    "op_status": _val(r.get("operational_status")),
+                    "discovery_source": _val(r.get("discovery_source")),
+                    "created_by": _val(r.get("sys_created_by")),
+                })
+                meta["stale_days"] = _days_since(meta["last_discovered"])
+                return n, meta
+        else:
+            print(f"❌ CMDB query HTTP {r1.status_code}: {r1.text[:200]!r}")
+
+    # B) Resolve u_workstations list against CMDB for this user
+    tokens = []
+    if u_ws_text:
+        tokens = [t.strip() for t in re.split(r"[,\n;\r]+", str(u_ws_text)) if t.strip()]
+    if user_sys_id and tokens:
+        ci_url = f"{instance}/api/now/table/cmdb_ci_computer"
+        q = (
+            f"assigned_to={user_sys_id}"
+            "^model_category.name=Computer"
+            f"^nameIN{','.join(tokens[:20])}"   # cap to keep URL manageable
+            "^ORDERBYDESClast_discovered"
+        )
+        params = {
+            "sysparm_query": q,
+            "sysparm_display_value": "true",
+            "sysparm_limit": "20",
+            "sysparm_fields": ",".join([
+                "name","os","u_device_trust","last_discovered",
+                "install_status","life_cycle_stage_status","operational_status",
+                "discovery_source","sys_created_by"
+            ])
+        }
+        r2 = requests.get(ci_url, auth=HTTPBasicAuth(username, password), params=params, timeout=60)
+        if r2.status_code == 200:
+            for r in (r2.json() or {}).get("result", []) or []:
+                n = _val(r.get("name")).replace("\n", " ").replace("\r", " ").strip()
+                os_name = _val(r.get("os")).lower()
+                trust   = _val(r.get("u_device_trust")).lower()
+                if not n or "windows" not in os_name or trust not in ("azuread","hybridad"):
+                    continue
+                meta.update({
+                    "source": "u_workstations_resolved",
+                    "decision": "picked newest token that still exists in CMDB",
+                    "last_discovered": _val(r.get("last_discovered")),
+                    "install_status": _val(r.get("install_status")),
+                    "life_cycle": _val(r.get("life_cycle_stage_status")),
+                    "op_status": _val(r.get("operational_status")),
+                    "discovery_source": _val(r.get("discovery_source")),
+                    "created_by": _val(r.get("sys_created_by")),
+                })
+                meta["stale_days"] = _days_since(meta["last_discovered"])
+                return n, meta
+        else:
+            print(f"❌ Token resolve HTTP {r2.status_code}: {r2.text[:200]!r}")
+
+    # C) Last resort: first token from text list
+    # --- C) Last resort: DO NOT use text-only value; treat as Unknown
+    if tokens:
+        meta.update({
+            "source": "u_workstations_first",
+            "decision": "no CMDB match; suppressed text-only token",
+    })
+    return None, meta  # <-- was: return first_only(...)
+
+# ---------------------- Query ServiceNow RITMs ------------------
+url = f"{instance}/api/now/table/sc_req_item"
+params = {
+    "sysparm_query": (
+        "company.name=Flint Hills Resources"
+        "^u_new_hire=false"
+        "^cat_item.nameLIKElaptop"
+        "^ORcat_item.nameLIKEsurface"
+        "^opened_atRELGTjavascript:gs.daysAgoStart(60)^ORclosed_atRELGTjavascript:gs.daysAgoStart(60)"
+        "^ORDERBYDESCclosed_at"
+    ),
+    "sysparm_display_value": "all",
+    "sysparm_limit": "20"
+}
+
+response = requests.get(url, auth=HTTPBasicAuth(username, password), params=params, timeout=120)
+
+if response.status_code != 200:
+    print(f"❌ Error: {response.status_code}")
+    print(response.text)
+    raise SystemExit(1)
+
+print("✅ Success!")
+data = response.json()
+print(f"Total records returned: {len(data.get('result', []))}")
+
+rows = []
+for item in data.get("result", []):
+    sid = item.get("sys_id")
+    sid_print = sid.get("value") if isinstance(sid, dict) else sid
+    print("→ Processing item ID:", sid_print)
+
+    # Load requested_for user details
+    requested_for_info = fetch_details(item.get("requested_for", {}).get("link"))
+
+    user_location = (
+        (requested_for_info.get("location", {}) or {}).get("display_value")
+        or (requested_for_info.get("u_location", {}) or {}).get("display_value")
+        or requested_for_info.get("u_site_id")
+        or "Unknown"
+    )
+    user_sys_id = requested_for_info.get("sys_id")
+    u_ws_text = format_workstation_string(requested_for_info.get("u_workstations", ""))
+
+    # Choose one workstation with provenance
+    ws_name, ws_meta = resolve_user_workstation_with_provenance(user_sys_id, u_ws_text)
+
+    rows.append({
+        "Requested For": (item.get("requested_for", {}) or {}).get("display_value", "Unknown"),
+        "Requested For Email": requested_for_info.get("email", "Unknown"),
+        "Requested For Location": user_location,
+        "Catalog Item": (item.get("cat_item", {}) or {}).get("display_value", "Unknown"),
+        "Created": (item.get("opened_at", {}) or {}).get("display_value", "Unknown") if isinstance(item.get("opened_at"), dict) else item.get("opened_at", "Unknown"),
+        "Closed": (item.get("closed_at", {}) or {}).get("display_value", "Unknown") if isinstance(item.get("closed_at"), dict) else item.get("closed_at", "Unknown"),
+
+        # Workstation & provenance
+        "Workstations": ws_name or "Unknown",
+        "WS Source": ws_meta["source"] or "Unknown",
+        "WS Decision": ws_meta["decision"] or "",
+        "WS Last Discovered": ws_meta["last_discovered"] or "",
+        "WS Stale (days)": ws_meta["stale_days"],
+        "WS Install Status": ws_meta["install_status"],
+        "WS Life Cycle": ws_meta["life_cycle"],
+        "WS Op Status": ws_meta["op_status"],
+        "WS Discovery Source": ws_meta["discovery_source"],
+        "WS Created By": ws_meta["created_by"],
+    })
+
+df = pd.DataFrame(rows)
+
+# ------------------------------ Group by Location ---------------
+def normalize_location(loc: str) -> str:
+    if not loc:
+        return "Unknown"
+    loc_u = str(loc).upper()
+    if "CORPUSCHRISTI" in loc_u or "CORPUS CHRISTI" in loc_u:
+        return "Corpus Christi"
+    elif "ROSEMOUNT" in loc_u or "PINE BEND" in loc_u:
+        return "Rosemount"
+    elif "WICHITA" in loc_u:
+        return "Wichita"
+    else:
+        return "Other"
+
+df["Location Group"] = df["Requested For Location"].apply(normalize_location)
+
+# Optional: flag suspicious rows
+def _flag(row):
+    if row["WS Source"] == "u_workstations_first":
+        return "⚠️ text-only (no CMDB match)"
+    if row["WS Stale (days)"] is not None and row["WS Stale (days)"] > 90:
+        return "⚠️ stale CI (>90d)"
+    if str(row["WS Install Status"]).lower().startswith(("retired","disposed","decomm")):
+        return "⚠️ retired"
+    return ""
+
+df["WS Flag"] = df.apply(_flag, axis=1)
+
+# -------------------------- Write to Excel ----------------------
+# Adjust this to your synced SharePoint/OneDrive location:
+output_dir = r"C:\Users\ellism3\kochind.com\FHR Endpoint Services - FHR Computer Refresh List Last 60 Days"
+os.makedirs(output_dir, exist_ok=True)
+
+excel_path = os.path.join(output_dir, "fhr_computer_requests.xlsx")
+
+try:
+    df.to_excel(excel_path, index=False, engine="openpyxl")
+except PermissionError:
+    raise SystemExit(f"❌ PermissionError writing {excel_path}. Is the file open in Excel?")
+
+# --------------------------- Format Excel Header ----------------
+wb = load_workbook(excel_path)
+ws = wb.active
+
+ws.insert_rows(1)
+header_text = "FHR Laptop Requests Report"
+total_columns = ws.max_column
+end_col_letter = get_column_letter(total_columns)
+ws.merge_cells(f"A1:{end_col_letter}1")
+header_cell = ws["A1"]
+header_cell.value = header_text
+header_cell.font = Font(size=16, bold=True)
+header_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+# ------------------------- Adjust column widths -----------------
+for col in ws.columns:
+    max_length = 0
+    column = col[0].column
+    col_letter = get_column_letter(column)
+    for cell in col:
+        try:
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        except Exception:
+            pass
+    if ws.cell(row=2, column=column).value == "Workstations":
+        ws.column_dimensions[col_letter].width = 40
+    else:
+        ws.column_dimensions[col_letter].width = max_length + 2
+
+# ------------------------ Embed pie chart -----------------------
+location_counts = df["Location Group"].value_counts()
+
+def make_autopct(values):
+    def my_autopct(pct):
+        total = sum(values)
+        count = int(round(pct * total / 100.0))
+        return f"{count}"
+    return my_autopct
+
+pie_buffer = BytesIO()
+plt.figure(figsize=(6, 6))
+plt.pie(
+    location_counts,
+    labels=location_counts.index,
+    autopct=make_autopct(location_counts),
+    startangle=140,
+)
+plt.title(f"Laptop Requests by Location (Total: {location_counts.sum()})")
+plt.axis("equal")
+plt.tight_layout()
+plt.savefig(pie_buffer, format="png")
+plt.close()
+
+pie_buffer.seek(0)
+img = XLImage(pie_buffer)
+img.width = 350
+img.height = 350
+ws.add_image(img, "J6")
+print("📊 Pie chart embedded in Excel at J6")
+
+wb.save(excel_path)
+print(f"📁 Excel with embedded chart saved to {excel_path}")

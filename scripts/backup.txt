@@ -8,10 +8,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, Alignment
+from openpyxl.drawing.image import Image as XLImage
 
-# Load environment
+# -----------------------Load environment----------------------
+
 env_path = Path(__file__).resolve().parent / "servicenow.env"
 load_dotenv(dotenv_path=env_path)
 
@@ -24,6 +25,8 @@ print("Instance loaded:", instance)
 print("Username loaded:", username)
 print("Password loaded:", bool(password))
 
+#-----------------------Fetch Full User and Device Info----------------
+
 def fetch_details(link):
     if not link:
         return {}
@@ -32,40 +35,73 @@ def fetch_details(link):
         return res.json().get("result", {})
     return {}
 
+#-------------------------Clean formatting of workstation strings-----------------
+
 def format_workstation_string(ws_string):
-    return ws_string.replace("\\n", ", ").replace("\\r", "").replace("\n", ", ").replace("\r", "").strip().lstrip(", ")
+    return ws_string.replace("\\n", ", ").replace("\\r", "").replace("\\n", ", ").replace("\\r", "").strip().lstrip(", ")
+
+#-------------------------Pull workstation CI's for a user-----------------------
 
 def get_current_workstation_from_ci(user_sys_id):
     ci_url = f"{instance}/api/now/table/cmdb_ci_computer"
     params = {
         "sysparm_query": (
             f"assigned_to={user_sys_id}"
-            "^install_status=1"
             "^model_category.name=Computer"
-            "^sys_class_name=cmdb_ci_computer"
-            "sys_class_name=cmdb_ci_handheld_computing"
-            "^life_cycle_stage_status.name=In Use"
-            "^last_discoveredRELGTjavascript:gs.monthsAgoStart(3)"
-            "^hardware_status!=retired"
             "^ORDERBYDESClast_discovered"
         ),
-        "sysparm_limit": "3",
-        "sysparm_display_value": "true"
+        "sysparm_display_value": "true",
+        "sysparm_limit": "50"
     }
-    res = requests.get(ci_url, auth=HTTPBasicAuth(username, password), params=params)
-    if res.status_code == 200:
-        records = res.json().get("result", [])
-        if records:
-            devices = []
-            for r in records:
-                name = r.get("name")
-                sccm = "SCCM" if r.get("u_sccm_record") else "Modern"
-                if name:
-                    devices.append(f"{name} ({sccm})")
-            return format_workstation_string(", ".join(devices))
-    return None
 
-# Query ServiceNow
+    response = requests.get(ci_url, auth=HTTPBasicAuth(username, password), params=params)
+
+    if response.status_code != 200:
+        print(f"❌ Error fetching CIs: {response.status_code}")
+        return None
+
+    records = response.json().get("result", [])
+    all_devices = []
+
+    for r in records:
+        name = r.get("name")
+        class_name = r.get("sys_class_name")
+
+        model_id = r.get("model_id")
+        if isinstance(model_id, dict):
+            model_name = model_id.get("display_value", "").lower()
+        elif isinstance(model_id, str):
+            model_name = model_id.lower()
+        else:
+            model_name = ""
+
+        os_raw = r.get("os")
+        os_name = os_raw.lower() if isinstance(os_raw, str) else ""
+
+        trust_raw = r.get("u_device_trust")
+        device_trust = trust_raw.lower() if isinstance(trust_raw, str) else ""
+
+        # ✅ Only allow Windows devices with AzureAD or HybridAD trust
+        if "windows" not in os_name or device_trust not in ("azuread", "hybridad"):
+            print(f"🛑 Skipping device: {name} (OS: {os_name}, Trust: {device_trust})")
+            continue
+        
+#-----------------Sanitize name to prevent newlines from breaking formatting-----------
+
+        if isinstance(name, str):
+            name = name.replace("\n", " ").replace("\r", " ").strip()
+
+
+        if name and class_name:
+            device_str = name
+            if device_str not in all_devices:
+                all_devices.append(device_str)
+
+    return format_workstation_string(", ".join(all_devices)) if all_devices else None
+
+
+#----------------------Query ServiceNow--------------------------
+
 url = f"{instance}/api/now/table/sc_req_item"
 params = {
     "sysparm_query": (
@@ -77,7 +113,7 @@ params = {
         "^ORDERBYDESCclosed_at"
     ),
     "sysparm_display_value": "all",
-    "sysparm_limit": "10"
+    "sysparm_limit": "100"
 }
 
 response = requests.get(url, auth=HTTPBasicAuth(username, password), params=params)
@@ -118,6 +154,8 @@ if response.status_code == 200:
 
     df = pd.DataFrame(rows)
 
+#------------------------------Group by Location--------------------
+
     def normalize_location(loc):
         if not loc:
             return "Unknown"
@@ -133,11 +171,15 @@ if response.status_code == 200:
 
     df["Location Group"] = df["Requested For Location"].apply(normalize_location)
 
-    df.to_csv("filtered_laptop_requests.csv", index=False)
-    print("📁 Data written to filtered_laptop_requests.csv")
+#--------------------------Write to CSV and Excel-------------------------
 
-    excel_path = "filtered_laptop_requests.xlsx"
+    output_dir = r"C:\Users\ellism3\kochind.com\FHR Endpoint Services - FHR Computer Refresh List Last 60 Days"
+    excel_path = os.path.join(output_dir, "fhr_computer_requests.xlsx")
     df.to_excel(excel_path, index=False, engine="openpyxl")
+
+
+    
+#---------------------------Format Excel Header-------------------------
 
     wb = load_workbook(excel_path)
     ws = wb.active
@@ -151,6 +193,8 @@ if response.status_code == 200:
     header_cell.value = header_text
     header_cell.font = Font(size=16, bold=True)
     header_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+#-------------------------Adjust column widths------------------------
 
     for col in ws.columns:
         max_length = 0
@@ -166,16 +210,11 @@ if response.status_code == 200:
             ws.column_dimensions[col_letter].width = 40
         else:
             ws.column_dimensions[col_letter].width = max_length + 2
+    from io import BytesIO
+    import matplotlib.pyplot as plt
+    from openpyxl.drawing.image import Image as XLImage
 
-    logo_path = "fhr_logo.png"
-    if Path(logo_path).exists():
-        logo = XLImage(logo_path)
-        logo.width = 120
-        logo.height = 40
-        ws.add_image(logo, "A2")
-        print("🖼️ Logo inserted at A2")
-    else:
-        print("⚠️ Logo file not found:", logo_path)
+#------------------------Embed pie chart--------------------------
 
     location_counts = df["Location Group"].value_counts()
 
@@ -186,24 +225,25 @@ if response.status_code == 200:
             return f"{count}"
         return my_autopct
 
-    chart_path = "location_pie_chart.png"
+    pie_buffer = BytesIO()
     plt.figure(figsize=(6, 6))
     plt.pie(location_counts, labels=location_counts.index, autopct=make_autopct(location_counts), startangle=140)
     plt.title(f"Laptop Requests by Location (Total: {location_counts.sum()})")
     plt.axis("equal")
     plt.tight_layout()
-    plt.savefig(chart_path)
+    plt.savefig(pie_buffer, format="png")
     plt.close()
-    print("📊 Pie chart saved as", chart_path)
 
-    img = XLImage(chart_path)
+    pie_buffer.seek(0)
+    img = XLImage(pie_buffer)
     img.width = 350
     img.height = 350
     ws.add_image(img, "J6")
+    print("📊 Pie chart embedded in Excel at J6")
 
     wb.save(excel_path)
     print(f"📁 Excel with embedded chart saved to {excel_path}")
-
+    
 else:
     print(f"❌ Error: {response.status_code}")
     print(response.text)
