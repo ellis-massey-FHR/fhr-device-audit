@@ -1,13 +1,21 @@
+# scripts/get_servicenow_data.py
 import os
+import sys
 import json
+from io import BytesIO
 from pathlib import Path
+from urllib.parse import quote
+
 import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 import pandas as pd
+
+# ---- Headless matplotlib for CI/Codespaces BEFORE pyplot import ----
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment
@@ -26,6 +34,11 @@ print("ENV path:", env_path)
 print("Instance loaded:", instance)
 print("Username loaded:", username)
 print("Password loaded:", bool(password))
+
+# Output directory: default to ./output in Codespaces/CI, but allow override
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+EXCEL_PATH = OUTPUT_DIR / "fhr_computer_requests.xlsx"
 
 #-----------------------Fetch Full User and Device Info----------------
 
@@ -185,7 +198,7 @@ if response.status_code == 200:
     output_dir = Path(os.getenv("OUTPUT_DIR", "output"))   # default: ./output
     output_dir.mkdir(parents=True, exist_ok=True)
     excel_path = output_dir / "fhr_computer_requests.xlsx"
-    
+
 # df.to_excel(excel_path, index=False, engine="openpyxl")
 
     #---------------------------Format Excel Header-------------------------
