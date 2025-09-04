@@ -36,13 +36,27 @@ jobs:
             echo "SERVICENOW_PASS=${SERVICENOW_PASS}"
           } > scripts/servicenow.env
 
+      # Make an absolute output directory and pass it to your script
+      - name: "Prepare output dir"
+        run: |
+          mkdir -p "${{ github.workspace }}/output"
+
       - name: "Run report (headless) and capture log"
         env:
           MPLBACKEND: Agg
           PYTHONIOENCODING: utf-8
+          OUTPUT_DIR: ${{ github.workspace }}/output
         run: |
           set -o pipefail
           python -X utf8 scripts/get_servicenow_data.py | tee runlog.txt
+
+      - name: "Verify Excel exists"
+        run: |
+          ls -lah "${{ github.workspace }}/output" || true
+          test -f "${{ github.workspace }}/output/fhr_computer_requests.xlsx" || { 
+            echo "❌ Excel not found in output/. See runlog.txt artifact."; 
+            exit 1; 
+          }
 
       - name: "Upload run log (always)"
         if: always()
@@ -52,31 +66,11 @@ jobs:
           path: runlog.txt
           if-no-files-found: warn
 
-      - name: "Verify ServiceNow success"
-        run: |
-          # Your script prints "Success!" on HTTP 200
-          if ! grep -q "Success!" runlog.txt; then
-            echo "❌ ServiceNow call did not succeed. See the 'runlog' artifact for details."
-            exit 1
-          fi
-
-      - name: "Find Excel and stage for artifact"
-        run: |
-          mkdir -p output
-          FILE="$(find . -maxdepth 8 -type f -name 'fhr_computer_requests.xlsx' -print -quit)"
-          if [ -z "$FILE" ]; then
-            echo "❌ Excel not found after a 'Success!' log. See runlog.txt for Python errors after fetch."
-            exit 1
-          fi
-          echo "✅ Found: $FILE"
-          cp -f "$FILE" output/
-          ls -lah output
-
       - name: "Upload Excel artifact"
         uses: actions/upload-artifact@v4
         with:
           name: fhr-computer-requests
-          path: output/fhr_computer_requests.xlsx
+          path: ${{ github.workspace }}/output/fhr_computer_requests.xlsx
           if-no-files-found: error
 
       - name: "Commit results to repo (optional)"
