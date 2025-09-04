@@ -3,7 +3,7 @@ name: "Generate FHR Device Audit Report"
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 13 * * 1-5"  # weekdays 06:00 PT
+    - cron: "0 13 * * 1-5"  # weekdays 06:00 PT (America/Los_Angeles)
 
 jobs:
   run:
@@ -21,7 +21,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # Ensure these are present even if requirements.txt misses any
+          # Ensure these even if requirements.txt misses any
           pip install requests python-dotenv pandas numpy openpyxl matplotlib pillow
 
       - name: "Create ServiceNow env file"
@@ -37,41 +37,59 @@ jobs:
             echo "SERVICENOW_PASS=${SERVICENOW_PASS}"
           } > scripts/servicenow.env
 
-      - name: "Run report (headless matplotlib)"
+      # Your code writes to a Windows-looking path; create it on Linux so the write succeeds
+      - name: "Pre-create hardcoded path"
+        run: |
+          mkdir -p "C:\Users\ellism3\kochind.com\FHR Endpoint Services - FHR Computer Refresh List Last 60 Days"
+
+      - name: "Run report (headless matplotlib) and capture log"
         env:
           MPLBACKEND: Agg
           PYTHONIOENCODING: utf-8
         run: |
-          python -X utf8 scripts/get_servicenow_data.py
+          set -o pipefail
+          python -X utf8 scripts/get_servicenow_data.py | tee runlog.txt
 
       - name: "Debug: list any Excel files"
         run: |
           echo "PWD: $(pwd)"
-          echo "Top-level:"
+          echo "Top-level listing:"
           ls -la
-          echo "Searching for Excel files (up to depth 6):"
-          find . -maxdepth 6 -type f -name "*.xlsx" -print || true
+          echo "Listing Windows-style path (if created):"
+          ls -la "C:\Users\ellism3\kochind.com\FHR Endpoint Services - FHR Computer Refresh List Last 60 Days" || true
+          echo "Searching for Excel files (up to depth 8):"
+          find . -maxdepth 8 -type f -name "*.xlsx" -print || true
 
       - name: "Collect Excel into ./output"
         run: |
           mkdir -p output
-          FILE="$(find . -maxdepth 6 -type f -name 'fhr_computer_requests.xlsx' -print -quit)"
+          FILE="$(find . -maxdepth 8 -type f -name 'fhr_computer_requests.xlsx' -print -quit)"
           if [ -z "$FILE" ]; then
-            echo "Did not find fhr_computer_requests.xlsx anywhere under $(pwd)."
+            echo "❌ Did not find fhr_computer_requests.xlsx under $(pwd). See runlog.txt artifact."
             exit 1
           fi
-          echo "Found: $FILE"
+          echo "✅ Found: $FILE"
           cp -f "$FILE" output/
           ls -lah output
 
-      - name: "Upload artifact"
+      - name: "Upload Excel artifact"
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: fhr-computer-requests
           path: output/fhr_computer_requests.xlsx
           if-no-files-found: error
 
+      - name: "Upload run log (always)"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runlog
+          path: runlog.txt
+          if-no-files-found: warn
+
       - name: "Commit results to repo (optional)"
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
