@@ -17,5 +17,9 @@ tzdata==2025.2
 urllib3==2.4.0
 openpyxl
 matplotlib
+azure-functions
+fastapi
+pydantic
+uvicorn
 
 
