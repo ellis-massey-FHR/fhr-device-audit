@@ -7,53 +7,49 @@ pipeline {
     }
   }
 
-  environment {
-    TZ = 'America/Chicago'
-    // Example for secrets later:
-    // API_TOKEN = credentials('my-api-token-id')
+  parameters {
+    string(name: 'SCRIPT_PATH', defaultValue: 'scripts/get_servicenow_data.py', description: 'Path to the Python script in the repo')
+    string(name: 'SCRIPT_ARGS', defaultValue: '', description: 'Optional args to pass to the script')
   }
 
-  // Run on weekdays near 7 AM CT; remove or edit as you like
-  triggers { cron('H 7 * * 1-5') }
+  environment { TZ = 'America/Chicago' }
+  triggers { cron('H 7 * * 1-5') }  // runs on weekdays; you can remove/adjust
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-  }
+  options { timestamps(); disableConcurrentBuilds(); buildDiscarder(logRotator(numToKeepStr: '20')) }
 
   stages {
-    stage('Checkout') { steps { checkout scm } }
+    stage('Checkout'){ steps { checkout scm } }
 
-    stage('Setup Python') {
+    stage('Setup Python'){
       steps {
         sh '''
           python --version
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
         '''
       }
     }
 
-    stage('Run Task') {
+    stage('Run'){
       steps {
         sh '''
           set -e
           mkdir -p output
-          if [ -f scripts/my_task.py ]; then
-            python scripts/my_task.py
-          elif [ -f main.py ]; then
-            python main.py
-          else
-            echo "No known entrypoint. Update Jenkinsfile."; exit 1
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "❌ SCRIPT_PATH not found: $SCRIPT_PATH"
+            echo "Repo layout:"
+            ls -R | sed -n '1,200p'
+            exit 1
           fi
+          echo "▶ Running: python $SCRIPT_PATH $SCRIPT_ARGS"
+          python "$SCRIPT_PATH" $SCRIPT_ARGS
         '''
       }
     }
 
-    stage('Archive Outputs') {
+    stage('Archive'){
       when { expression { fileExists('output') } }
-      steps { archiveArtifacts artifacts: 'output/**', fingerprint: true }
+      steps { archiveArtifacts artifacts: 'output/**', fingerprint: true, allowEmptyArchive: true }
     }
   }
 
