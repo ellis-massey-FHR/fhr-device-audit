@@ -18,6 +18,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment
 from openpyxl.drawing.image import Image as XLImage
 
+
 # -----------------------Load environment----------------------
 env_path = Path(__file__).resolve().parent / "servicenow.env"
 load_dotenv(dotenv_path=env_path)
@@ -85,7 +86,35 @@ def get_current_workstation_from_ci(user_sys_id):
         name = r.get("name")
         class_name = r.get("sys_class_name")
 
-        # OS handling: include Windows or UNKNOWN; skip only if we know it's not Windows
+        if isinstance(name, str):
+            name = name.replace("\n", " ").replace("\r", " ").strip()
+
+        assigned_to = r.get("assigned_to", {})
+        assigned_to_name = assigned_to.get("display_value", "") if isinstance(assigned_to, dict) else str(assigned_to)
+
+        
+        hardware_status = str(r.get("hardware_status", "")).lower()
+        install_status = str(r.get("install_status", "")).lower()
+        last_discovered = str(r.get("last_discovered", "")).strip()
+
+# Skip bad/stale records
+        if hardware_status == "retired":
+            print(f"🛑 Skipping retired device: {name}")
+            continue
+
+        if install_status == "absent":
+            print(f"🛑 Skipping absent device: {name}")
+            continue
+
+        if not last_discovered:
+            if not name.upper().startswith(("FHR-", "PC-")):
+                print(f"🛑 Skipping non-workstation style device with no last_discovered: {name}")
+                continue
+            print(f"⚠️ Device has no last_discovered but keeping for review: {name}")
+            
+        
+        
+# OS handling: include Windows or UNKNOWN; skip only if we know it's not Windows
         os_raw = r.get("os")
         os_name = os_raw.lower() if isinstance(os_raw, str) else ""
 
@@ -110,20 +139,66 @@ def get_current_workstation_from_ci(user_sys_id):
 
     return format_workstation_string(", ".join(all_devices)) if all_devices else None
 
+def debug_find_device_by_name(device_name):
+    ci_url = f"{instance}/api/now/table/cmdb_ci_computer"
+    params = {
+        "sysparm_query": f"name={device_name}",
+        "sysparm_display_value": "true",
+        "sysparm_limit": "10",
+    }
+
+    response = requests.get(
+        ci_url,
+        auth=HTTPBasicAuth(username, password),
+        params=params,
+        timeout=60,
+    )
+
+    print(f"\n===== DEBUG SEARCH DEVICE: {device_name} =====")
+    print("Status:", response.status_code)
+
+    if response.status_code != 200:
+        print(response.text)
+        return
+
+    records = response.json().get("result", [])
+    print("Records found:", len(records))
+
+    for r in records:
+        print("Name:", r.get("name"))
+        print("Serial:", r.get("serial_number"))
+        print("Assigned To:", r.get("assigned_to"))
+        print("Owned By:", r.get("owned_by"))
+        print("Used By:", r.get("used_by"))
+        print("Primary User:", r.get("u_primary_user"))
+        print("Last Logged On User:", r.get("last_logged_on_user"))
+        print("Last Discovered:", r.get("last_discovered"))
+        print("Hardware Status:", r.get("hardware_status"))
+        print("Install Status:", r.get("install_status"))
+        print("OS:", r.get("os"))
+        print("Discovery Source:", r.get("discovery_source"))
+        print("Device Trust:", r.get("u_device_trust"))
+        print("Sys Class:", r.get("sys_class_name"))
+        print("Sys ID:", r.get("sys_id"))
+        print("-------------------------")
+
+
+
 #----------------------Query ServiceNow--------------------------
 url = f"{instance}/api/now/table/sc_req_item"
 params = {
     "sysparm_query": (
         "company.name=Flint Hills Resources"
         "^u_new_hire=false"
+        "^opened_atRELGTjavascript:gs.daysAgoStart(60)"
         "^cat_item.nameLIKElaptop"
         "^ORcat_item.nameLIKEsurface"
-        "^opened_atRELGTjavascript:gs.daysAgoStart(60)^ORclosed_atRELGTjavascript:gs.daysAgoStart(60)"
-        "^ORDERBYDESCclosed_at"
+        "^ORDERBYDESCopened_at"
     ),
     "sysparm_display_value": "all",
-    "sysparm_limit": "115",
+    "sysparm_limit": "250",
 }
+
 
 response = requests.get(url, auth=HTTPBasicAuth(username, password), params=params, timeout=120)
 
@@ -154,7 +229,7 @@ for item in results:
     recent_ws = get_current_workstation_from_ci(user_sys_id)
 
     if not recent_ws:
-        recent_ws = format_workstation_string(requested_for_info.get("u_workstations", ""))
+        recent_ws = "Unknown"
 
     rows.append({
         "Requested For": item.get("requested_for", {}).get("display_value", "Unknown"),
@@ -168,7 +243,24 @@ for item in results:
 
 df = pd.DataFrame(rows)
 
+#-----------------------------------------------------------
+# Force report to Created Date within last 60 days
+#-----------------------------------------------------------
+
+df["Created_dt"] = pd.to_datetime(df["Created"], errors="coerce")
+
+cutoff = pd.Timestamp.now() - pd.Timedelta(days=60)
+
+df = df[df["Created_dt"] >= cutoff]
+
+print("Rows after 60-day filter:", len(df))
+print("Oldest Created:", df["Created_dt"].min())
+print("Newest Created:", df["Created_dt"].max())
+
+df.drop(columns=["Created_dt"], inplace=True)
+
 #------------------------------Group by Location--------------------
+
 def normalize_location(loc):
     if not loc:
         return "Unknown"
@@ -247,3 +339,5 @@ print("📊 Pie chart embedded in Excel at J6")
 
 wb.save(EXCEL_PATH)
 print(f"✅ Excel with embedded chart saved to {EXCEL_PATH}")
+
+ ##python scripts\get_servicenow_data.py
